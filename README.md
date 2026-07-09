@@ -115,10 +115,15 @@ powershell -ExecutionPolicy Bypass -File scripts\run_all.ps1
 This creates the database, bulk-loads the CSV via `COPY`, builds and validates the
 star schema, and creates all 20 views.
 
-**Budget 25–30 minutes on a cold cache.** The CSV load is only ~2 minutes; the
-bulk of the time is the `fact_transactions` insert (6.36M rows joined twice into
-the 9M-row account dimension) and the six indexes built afterwards. It is safe to
-re-run — script 03 drops with `CASCADE` and scripts 06–10 rebuild the views.
+**Budget ~70 minutes on a cold cache** (measured, not estimated). The CSV load is
+only ~2 minutes. Almost all the rest is the `fact_transactions` insert, which
+assigns surrogate keys with `ROW_NUMBER() OVER (ORDER BY …)` — a sort of 6.36M
+wide rows that spilled 16 GB across 2,744 temp files. That sort buys deterministic
+keys across rebuilds; if you have the RAM and want it faster, raise `work_mem` and
+`maintenance_work_mem` at the top of `sql/04_populate_star_schema.sql`.
+
+It is safe to re-run — script 03 drops with `CASCADE` and scripts 06–10 rebuild
+the views.
 
 On success it prints the headline figures, so a good run evidences itself:
 

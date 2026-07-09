@@ -16,9 +16,16 @@
 # Safe to re-run: script 03 drops with CASCADE, removing the dependent views, and
 # scripts 06-10 recreate them.
 #
-# Runtime from scratch on a cold cache: roughly 25-30 minutes. Most of it is the
-# fact_transactions insert (6.36M rows joined twice into a 9M-row account
-# dimension) and the six indexes built afterwards. The CSV load is only ~2 min.
+# Runtime from scratch: MEASURED AT 71 MINUTES on a cold cache with a spinning
+# disk. Nearly all of it is the fact_transactions insert. That insert assigns
+# surrogate keys with ROW_NUMBER() OVER (ORDER BY step, name_orig, amount), which
+# sorts 6.36M wide rows and spilled 16 GB across 2,744 temp files at the
+# work_mem setting in 04_populate_star_schema.sql.
+#
+# The sort buys deterministic surrogate keys across rebuilds, which is worth
+# having. If you need it faster and have the RAM, raise work_mem and
+# maintenance_work_mem at the top of 04_populate_star_schema.sql.
+# The CSV load itself is only ~2 minutes.
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
@@ -122,5 +129,8 @@ FROM vw_dashboard_kpi;
 
 $elapsed = (Get-Date) - $started
 Write-Host ""
-Write-Host ("Build complete in {0:mm}m {0:ss}s. Connect Power BI to database '{1}'." -f $elapsed, $db) -ForegroundColor Green
+# Use TotalMinutes, not the "mm" format specifier: "{0:mm}" prints the MINUTES
+# COMPONENT of the TimeSpan and silently discards the hours. A 70-minute build
+# reported itself as "10m 38s" until this was fixed.
+Write-Host ("Build complete in {0:N1} minutes. Connect Power BI to database '{1}'." -f $elapsed.TotalMinutes, $db) -ForegroundColor Green
 Write-Host "See docs/powerbi_build_guide.md for the dashboard build." -ForegroundColor Green

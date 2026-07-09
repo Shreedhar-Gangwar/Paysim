@@ -51,19 +51,32 @@ If those five numbers appear, the whole pipeline — load, transform, assertions
 validation, fee model, deduplication — worked. If they do not, something upstream
 threw and `ON_ERROR_STOP=1` halted it.
 
-## Runtime
+## Runtime — measured, after two wrong estimates
 
-The full rebuild is slower than the numbers in the build guide suggest, because
-those were measured on a warm database. From scratch:
+I guessed 6–8 minutes, then 25–30. **The measured cold-cache rebuild is 70.7
+minutes.** Both earlier figures were written before anyone had run the thing end
+to end.
 
-- CSV load via `COPY`: ~2 minutes
-- `dim_accounts` (9,073,900 rows): ~1 minute
-- `fact_transactions` insert (6.36M rows, two joins into the 9M-row account
-  dimension) plus six indexes: **20+ minutes on a cold cache**
-- Validation, views, matview refresh: ~3 minutes
+Where the time goes: the CSV `COPY` is ~2 minutes. Nearly everything else is the
+`fact_transactions` insert, which assigns surrogate keys with
+`ROW_NUMBER() OVER (ORDER BY step, name_orig, amount)`. That sorts 6.36M wide rows
+(including a text column) and **spilled 16 GB across 2,744 temp files**, competing
+with WAL writes for the same disk — WAL throughput measured at 1.9 MB/s while it
+ran.
 
-Call it **25–30 minutes end to end**, not the 6–8 minutes I first wrote in the
-script header. The `README` and the script comment should say so.
+The sort is the price of deterministic surrogate keys across rebuilds, which is
+worth paying. Raising `work_mem` / `maintenance_work_mem` in
+`04_populate_star_schema.sql` is the lever if you want it faster.
+
+### And the runner lied about its own runtime
+
+`"{0:mm}m {0:ss}s" -f $elapsed` prints the **minutes component** of a `TimeSpan`
+and silently discards the hours. The 70.7-minute build reported itself as
+**"Build complete in 10m 38s"**. Fixed to use `$elapsed.TotalMinutes`.
+
+A timing bug in a script whose only job is to prove reproducibility is not a
+cosmetic defect: it would have quietly convinced the next person that a
+70-minute build takes 10.
 
 ## Data dictionary highlights
 
