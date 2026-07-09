@@ -16,10 +16,17 @@
 --   dim_accounts          — one row per distinct account id
 -- =============================================================================
 
-DROP TABLE IF EXISTS fact_transactions;
-DROP TABLE IF EXISTS dim_date;
-DROP TABLE IF EXISTS dim_transaction_type;
-DROP TABLE IF EXISTS dim_accounts;
+-- CASCADE is required, not optional. On a rebuild, every analytical view in
+-- sql/07-10 and the materialized view mv_duplicate_cashout_legs depend on these
+-- tables, and a bare DROP TABLE fails with "other objects depend on it".
+--
+-- Dropping the dependent views here is safe because scripts 06-10 recreate all
+-- of them from scratch immediately afterwards. If you run 03 and 04 by hand,
+-- you MUST also re-run 06 through 10 or the views will be gone.
+DROP TABLE IF EXISTS fact_transactions    CASCADE;
+DROP TABLE IF EXISTS dim_date             CASCADE;
+DROP TABLE IF EXISTS dim_transaction_type CASCADE;
+DROP TABLE IF EXISTS dim_accounts         CASCADE;
 
 
 -- -----------------------------------------------------------------------------

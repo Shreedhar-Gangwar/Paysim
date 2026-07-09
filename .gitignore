@@ -10,6 +10,12 @@ __pycache__/
 .venv/
 venv/
 
+# Power BI working files. The .pbix may be committed if you want it in the repo,
+# but its temp/cache siblings never should be.
+*.pbix.tmp
+*.pbix.bak
+~$*.pbix
+
 # OS / editor noise
 Thumbs.db
 .DS_Store
