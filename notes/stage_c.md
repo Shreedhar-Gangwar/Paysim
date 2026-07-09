@@ -75,32 +75,77 @@ the right answer.
 | **1M–10M** | 123,351 | 1,233.51 | 3,820.81 | **−2,587.43** | 0.49% |
 | **over 10M** | 5,508 | 55.08 | 1,450.00 | **−1,394.93** | 0.07% |
 
-The two largest bands destroy the product. Above ~1M the 10,000 cap crushes the
-effective take rate to 0.49% and then 0.07%, while fraud scales with the
-transaction size, uncapped. **The cap protects the customer from a runaway fee
-and hands the entire downside to us.**
+Above ~1M the 10,000 cap crushes the effective take rate to 0.49% and then 0.07%,
+while fraud scales with transaction size, uncapped.
 
-This is exactly the trade-off the hybrid model was chosen to expose, and it is
-the strongest argument in the project for a risk-based fee or a hard transfer
-limit above 1M.
+**Why revenue in the over-10M band (55.08M) is LOWER than in 1M–10M (1,233.51M).**
+This looks wrong and is not. The cap binds at exactly 1M (1% of 1M = 10,000), so
+**every** TRANSFER at or above 1M pays a flat 10,000 — regardless of whether it
+moves 1M or 92M. Revenue in those bands is therefore purely a headcount:
+
+- 1M–10M: 123,351 txns × 10,000 = **1,233.51M**
+- over 10M: 5,508 txns × 10,000 = **55.08M**
+
+There are simply 22× fewer transactions above 10M. The band moves 78,786.92M of
+value and earns 55.08M, which is the cap working exactly as designed.
+
+**Does the cap CAUSE TRANSFER's loss? No — and my first framing overstated it.**
+Removing the cap entirely (pure 1%, no ceiling) gives TRANSFER 4,852.92M of
+revenue instead of 2,861.31M. Against 6,067.21M of fraud loss that is still
+**−1,214.82M net**. The product loses money uncapped.
+
+So the honest statement is: **fraud makes TRANSFER loss-making; the cap makes it
+worse** (−1,214.82M → −3,206.44M). The cap is a contributing factor, not the
+cause. Repricing alone cannot fix this product — the fraud has to be addressed.
+That remains the strongest argument in the project for a risk-based fee or a
+transfer limit above 1M, but for the right reason.
 
 ---
 
-## The 10M CASH_OUT ceiling — a perfect (and useless) fraud rule
+## The 10M CASH_OUT cluster — a seeded balance, not a truncation cap
 
 **Every CASH_OUT of exactly 10,000,000.00 is fraudulent. All 142 of them.**
+That much is true. My first explanation of *why* was wrong, and the correction
+matters more than the finding.
 
-PaySim hard-caps CASH_OUT at 10M. Fraudsters draining large accounts hit that
-ceiling, so the amount truncates to exactly 10M. No legitimate transaction ever
-lands on that value.
+**What I claimed:** PaySim hard-caps CASH_OUT at 10M, so large thefts truncate
+to the ceiling.
 
-That single band is 1,420.00M of loss — 19% of all fraud loss in the dataset —
-against 0.71M of fee revenue.
+**What the data shows:** all 142 of those victim accounts had
+`oldbalance_org` of **exactly 10,000,000.00**, and all 142 were drained to zero.
+The amount is 10M because the *balance* was 10M. Nothing was truncated.
 
-It is a 100%-precision detection rule and it is **entirely a simulator
-artifact.** Worth showing on the dashboard as a striking exhibit; worth
-captioning as an artifact, not a technique. TRANSFER has no such ceiling
-(max 92,445,516.64), which is why only 145 of its 5,508 over-10M rows are fraud.
+Evidence against the truncation story:
+- A truncating cap piles transactions up just below the ceiling. There are only
+  **3** CASH_OUTs between 9.9M and 10M — no pile-up.
+- A truncating cap would catch legitimate transactions too. There are **zero**
+  non-fraud CASH_OUTs at exactly 10M.
+- 10,000,000.00 is not a CASH_OUT-only value: **2,920 non-fraudulent TRANSFERs**
+  sit at exactly 10M, alongside 145 fraudulent ones.
+
+So 10,000,000.00 is a **seeded round number** in the simulator — a cohort of
+accounts initialised with exactly that balance. CASH_OUT's maximum is 10M simply
+because that is the largest seeded balance available to drain, not because a cap
+clips it.
+
+That band is 1,420.00M of loss — 19% of all fraud loss — against 0.71M of fee
+revenue.
+
+The rule "CASH_OUT of exactly 10M ⇒ fraud" has 100% precision, but what it
+actually detects is *"an account seeded with a round 10M was emptied."* That is
+a property of the generator, not of fraud. Show it as a curiosity; never present
+it as a technique.
+
+## Data quality: 16 zero-amount transactions
+
+**16 CASH_OUT rows have `amount = 0.00`, and all 16 are flagged fraudulent.**
+
+A zero-value cash-out is not a real transaction. Under the current fee model the
+`fee_min` floor charges 10 currency units on each, so we book ~160 units of
+revenue on transactions that moved no money. The sum is immaterial (160 against
+8.4bn) but the principle is not: a floor should not charge a fee on a zero
+amount. Flagged here rather than silently patched — the fix belongs in a
+documented decision, not a quiet `WHERE amount > 0`.
 
 ---
 
@@ -201,9 +246,18 @@ from `vw_risk_balance_signature`.
 
 ---
 
+## Open decisions before Stage D
+1. **Zero-amount rows.** 16 fraudulent CASH_OUTs with `amount = 0`. Exclude them
+   from the fee floor, or leave and document? Immaterial in value, but a
+   reviewer will notice a fee charged on a zero-value transaction.
+2. **Is the TRANSFER cap right?** It binds on 24.18% of transfers. Uncapped, the
+   product still loses 1,214.82M. Raising or removing the cap changes the size of
+   the loss, not its sign. Worth deciding deliberately rather than inheriting.
+
 ## Carried into Stage D
 - Which views feed which visuals, and the DAX for each measure.
 - Every fraud-related visual needs the deduplication caption, or the dashboard
   will silently report 12.06bn.
 - The 10M CASH_OUT exhibit and the balance-signature exhibit both need
-  "simulator artifact" captions.
+  "simulator artifact" captions — and the 10M one must say *seeded balance*, not
+  *truncation cap*.
