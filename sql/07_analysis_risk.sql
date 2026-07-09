@@ -8,6 +8,54 @@
 
 
 -- =============================================================================
+-- mv_duplicate_cashout_legs — MATERIALIZED. The second leg of each two-step theft.
+--
+-- WHY MATERIALIZED, and this is a performance decision worth defending:
+-- identifying duplicate legs is cheap on its own (~50ms). But when that logic is
+-- inlined into a view that a downstream aggregate then joins to, the planner
+-- re-evaluates the anti-join per output group. vw_profitability_by_type took
+-- 87 SECONDS to return five rows. Materialising the 3,933 duplicate keys once
+-- and anti-joining against a unique index takes the same query to ~2 seconds.
+--
+-- It is a materialized view rather than a table because it is derived data with
+-- a definition worth reading. REFRESH it whenever fact_transactions is rebuilt:
+--     REFRESH MATERIALIZED VIEW mv_duplicate_cashout_legs;
+--
+-- A fraudulent CASH_OUT is a duplicate leg if some fraudulent TRANSFER shares
+-- its exact amount AND originator starting balance. See vw_fraud_loss_attribution
+-- for the evidence that this signature identifies the same theft.
+-- =============================================================================
+DROP MATERIALIZED VIEW IF EXISTS mv_duplicate_cashout_legs CASCADE;
+
+CREATE MATERIALIZED VIEW mv_duplicate_cashout_legs AS
+WITH fraudulent_transfers AS (
+    SELECT f.amount, f.oldbalance_org
+    FROM fact_transactions f
+    JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
+    WHERE f.is_fraud
+      AND t.type_name = 'TRANSFER'
+)
+SELECT f.transaction_key
+FROM fact_transactions f
+JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
+WHERE f.is_fraud
+  AND t.type_name = 'CASH_OUT'
+  AND EXISTS (
+      SELECT 1
+      FROM fraudulent_transfers ft
+      WHERE ft.amount         = f.amount
+        AND ft.oldbalance_org = f.oldbalance_org
+  );
+
+-- Unique index: makes the downstream anti-joins index lookups, and asserts that
+-- each duplicate leg is recorded exactly once.
+CREATE UNIQUE INDEX idx_mv_duplicate_cashout_legs
+    ON mv_duplicate_cashout_legs (transaction_key);
+
+ANALYZE mv_duplicate_cashout_legs;
+
+
+-- =============================================================================
 -- vw_fraud_loss_attribution
 --
 -- BUSINESS QUESTION: How much money did fraud actually take from us?
@@ -44,7 +92,7 @@
 CREATE OR REPLACE VIEW vw_fraud_loss_attribution AS
 WITH fraudulent_transfers AS (
     -- The first leg: money leaving the victim's account.
-    SELECT f.transaction_key, f.amount, f.oldbalance_org
+    SELECT f.transaction_key, f.amount
     FROM fact_transactions f
     JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
     WHERE f.is_fraud
@@ -52,24 +100,11 @@ WITH fraudulent_transfers AS (
 ),
 fraudulent_cashouts AS (
     -- The second leg: the same money being withdrawn -- or an independent theft.
-    SELECT f.transaction_key, f.amount, f.oldbalance_org
+    SELECT f.transaction_key, f.amount
     FROM fact_transactions f
     JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
     WHERE f.is_fraud
       AND t.type_name = 'CASH_OUT'
-),
-duplicate_cashouts AS (
-    -- A cash-out is a duplicate if some fraudulent transfer shares its exact
-    -- amount AND originator starting balance. EXISTS (not JOIN) so that a
-    -- cash-out is counted once even if several transfers share the signature.
-    SELECT c.transaction_key
-    FROM fraudulent_cashouts c
-    WHERE EXISTS (
-        SELECT 1
-        FROM fraudulent_transfers t
-        WHERE t.amount         = c.amount
-          AND t.oldbalance_org = c.oldbalance_org
-    )
 ),
 attributed_loss AS (
     SELECT 'TRANSFER' AS attributed_to,
@@ -80,12 +115,18 @@ attributed_loss AS (
 
     UNION ALL
 
+    -- NOT EXISTS against the materialized duplicate list (see above). NOT EXISTS
+    -- rather than NOT IN: NOT IN has surprising semantics if the subquery ever
+    -- yields a NULL, and the planner handles the anti-join better.
     SELECT 'CASH_OUT',
            'Independent theft: fraudulent cash-out with no matching transfer',
            COUNT(*),
            SUM(c.amount)
     FROM fraudulent_cashouts c
-    WHERE c.transaction_key NOT IN (SELECT transaction_key FROM duplicate_cashouts)
+    WHERE NOT EXISTS (
+        SELECT 1 FROM mv_duplicate_cashout_legs d
+        WHERE d.transaction_key = c.transaction_key
+    )
 
     UNION ALL
 
@@ -94,7 +135,10 @@ attributed_loss AS (
            COUNT(*),
            SUM(c.amount)
     FROM fraudulent_cashouts c
-    WHERE c.transaction_key IN (SELECT transaction_key FROM duplicate_cashouts)
+    WHERE EXISTS (
+        SELECT 1 FROM mv_duplicate_cashout_legs d
+        WHERE d.transaction_key = c.transaction_key
+    )
 )
 SELECT
     attributed_to,

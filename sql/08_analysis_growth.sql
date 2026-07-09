@@ -154,13 +154,25 @@ ORDER BY hour_of_day;
 -- Limited to the top 500 by value received: a BI tool does not need 2.7M rows,
 -- and this view is meant to feed a leaderboard visual.
 -- =============================================================================
+-- PERFORMANCE NOTE: this aggregates all 2,722,362 destinations and keeps 500.
+-- That is deliberate. Two "smarter" rewrites were measured and both were WORSE:
+--
+--   * Top-500 first, then active_days per account via LATERAL: 315 SECONDS.
+--     The lateral re-scans the fact table once per account.
+--   * Replacing the dim_date join with arithmetic, COUNT(DISTINCT (date_key-1)/24):
+--     355 SECONDS. A computed expression inside COUNT(DISTINCT) defeats the hash
+--     aggregate that the plain column reference gets.
+--
+-- The straightforward single-pass form below runs in ~25s. It is the slowest view
+-- in the project and that is acceptable: Power BI imports it once. Both
+-- "optimisations" were reverted after measurement -- neither was guessed correctly.
 CREATE OR REPLACE VIEW vw_growth_top_destinations AS
 WITH destination_activity AS (
     SELECT
         f.dest_account_key,
-        COUNT(*)                          AS txns_received,
-        SUM(f.amount)                     AS value_received,
-        COUNT(DISTINCT d.day_number)      AS active_days,
+        COUNT(*)                           AS txns_received,
+        SUM(f.amount)                      AS value_received,
+        COUNT(DISTINCT d.day_number)       AS active_days,
         COUNT(*) FILTER (WHERE f.is_fraud) AS fraud_txns_received
     FROM fact_transactions f
     JOIN dim_date d ON d.date_key = f.date_key

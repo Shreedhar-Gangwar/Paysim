@@ -94,7 +94,18 @@ JOIN dim_transaction_type d ON d.type_name = v.type_name;
 -- returns 0 without needing a branch. That is why the floor is 0 there and not
 -- 10 — a floor above zero would silently start charging for deposits.
 --
--- IMMUTABLE so the planner can inline it across 6.36M rows.
+-- PERFORMANCE: IMMUTABLE and PARALLEL SAFE so the planner inlines the body into
+-- the calling query and evaluates it as a plain expression across 6.36M rows.
+--
+-- It is deliberately NOT declared STRICT, and that matters more than it looks.
+-- PostgreSQL refuses to inline a STRICT SQL function whose body is non-strict --
+-- and LEAST/GREATEST are non-strict, because they ignore NULL arguments rather
+-- than returning NULL. Declared STRICT, this function is called 6,362,620 times
+-- through the executor: measured at 40.2 SECONDS. Inlined, the identical
+-- aggregate runs in 0.88 seconds -- a 45x difference for one keyword.
+--
+-- The arguments are never NULL in practice: amount is NOT NULL on the fact table
+-- and every fee_model column is NOT NULL.
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_transaction_fee(
     p_amount   NUMERIC,
@@ -102,7 +113,7 @@ CREATE OR REPLACE FUNCTION fn_transaction_fee(
     p_fee_min  NUMERIC,
     p_fee_max  NUMERIC
 ) RETURNS NUMERIC
-LANGUAGE sql IMMUTABLE STRICT AS $$
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
     SELECT LEAST(GREATEST(p_amount * p_fee_rate, p_fee_min), p_fee_max);
 $$;
 

@@ -33,8 +33,15 @@
 CREATE OR REPLACE VIEW vw_profitability_by_type AS
 WITH revenue_and_cost AS (
     -- Layer 1: fee revenue and processing cost, per transaction, rolled up.
+    --
+    -- PERFORMANCE: we group by the fact's SMALLINT transaction_type_key and only
+    -- resolve type_name afterwards. Grouping directly on dim_transaction_type
+    -- .type_name lets the planner satisfy the downstream merge join by walking
+    -- idx_fact_type -- a nested-loop index scan over all 6.36M rows with ~424k
+    -- random heap reads, which took 89 SECONDS to return five rows. Grouping on
+    -- the integer key instead gives a sequential scan into a hash aggregate.
     SELECT
-        t.type_name,
+        f.transaction_type_key,
         COUNT(*)      AS txn_count,
         SUM(f.amount) AS total_value,
         SUM(fn_transaction_fee(f.amount, m.fee_rate, m.fee_min, m.fee_max)) AS fee_revenue,
@@ -44,9 +51,14 @@ WITH revenue_and_cost AS (
         COUNT(*) FILTER (WHERE f.amount * m.fee_rate > m.fee_max)           AS txns_hitting_cap,
         COUNT(*) FILTER (WHERE f.amount * m.fee_rate < m.fee_min)           AS txns_hitting_floor
     FROM fact_transactions f
-    JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
-    JOIN fee_model m            ON m.transaction_type_key = f.transaction_type_key
-    GROUP BY t.type_name
+    JOIN fee_model m ON m.transaction_type_key = f.transaction_type_key
+    GROUP BY f.transaction_type_key
+),
+revenue_and_cost_named AS (
+    -- Attach the label to five aggregated rows, not to 6.36M raw ones.
+    SELECT t.type_name, rc.*
+    FROM revenue_and_cost rc
+    JOIN dim_transaction_type t ON t.transaction_type_key = rc.transaction_type_key
 ),
 attributed_fraud AS (
     -- Layer 2: deduplicated fraud loss, charged to the type that took the money.
@@ -65,7 +77,7 @@ combined AS (
         rc.txns_hitting_cap,
         rc.txns_hitting_floor,
         COALESCE(af.fraud_loss, 0) AS fraud_loss
-    FROM revenue_and_cost rc
+    FROM revenue_and_cost_named rc
     LEFT JOIN attributed_fraud af ON af.type_name = rc.type_name
 )
 SELECT
@@ -105,64 +117,80 @@ ORDER BY net_profit_millions DESC;
 -- so we exclude those rows outright rather than pro-rate them across bands.
 -- =============================================================================
 CREATE OR REPLACE VIEW vw_profitability_by_type_and_band AS
-WITH fraudulent_transfers AS (
-    SELECT f.amount, f.oldbalance_org
-    FROM fact_transactions f
-    JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
-    WHERE f.is_fraud AND t.type_name = 'TRANSFER'
-),
-duplicate_cashout_keys AS (
-    -- Same rule as vw_fraud_loss_attribution: a fraudulent CASH_OUT whose
-    -- (amount, starting balance) matches a fraudulent TRANSFER is the second
-    -- leg of a theft already counted.
-    SELECT f.transaction_key
-    FROM fact_transactions f
-    JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
-    WHERE f.is_fraud
-      AND t.type_name = 'CASH_OUT'
-      AND EXISTS (
-          SELECT 1 FROM fraudulent_transfers ft
-          WHERE ft.amount = f.amount AND ft.oldbalance_org = f.oldbalance_org
-      )
-),
-banded AS (
+WITH banded AS (
+    -- PERFORMANCE: band as a SMALLINT id, and group by the fact's integer type
+    -- key. Grouping by the text type_name and the text CASE label makes the
+    -- planner sort all 6.36M rows (external merge, ~98MB spilled to disk, ~14s).
+    -- Grouping on two small integers gives a hash aggregate over 30 groups.
+    -- The human-readable labels are attached afterwards, to 30 rows.
     SELECT
-        t.type_name,
+        f.transaction_type_key,
         CASE
-            WHEN f.amount <    10000 THEN '1. under 10K'
-            WHEN f.amount <   100000 THEN '2. 10K - 100K'
-            WHEN f.amount <   500000 THEN '3. 100K - 500K'
-            WHEN f.amount <  1000000 THEN '4. 500K - 1M'
-            WHEN f.amount < 10000000 THEN '5. 1M - 10M'
-            ELSE                          '6. over 10M'
-        END AS amount_band,
+            WHEN f.amount <    10000 THEN 1
+            WHEN f.amount <   100000 THEN 2
+            WHEN f.amount <   500000 THEN 3
+            WHEN f.amount <  1000000 THEN 4
+            WHEN f.amount < 10000000 THEN 5
+            ELSE                          6
+        END::SMALLINT AS band_id,
         f.amount,
         fn_transaction_fee(f.amount, m.fee_rate, m.fee_min, m.fee_max) AS fee,
         m.cost_per_txn,
-        -- Count the theft only where it is real money leaving a victim.
+        -- Count the theft only where it is real money leaving a victim: exclude
+        -- the duplicate CASH_OUT leg (see mv_duplicate_cashout_legs in 07).
+        --
+        -- PERFORMANCE: a LEFT JOIN evaluated once, not a correlated NOT EXISTS
+        -- inside the CASE. The correlated form issues 6.36M index lookups and
+        -- takes ~14s; the hash anti-join takes ~1s. dup.transaction_key IS NULL
+        -- means "this row is not a duplicate leg".
         CASE
-            WHEN f.is_fraud AND f.transaction_key NOT IN (SELECT transaction_key FROM duplicate_cashout_keys)
+            WHEN f.is_fraud AND dup.transaction_key IS NULL
             THEN f.amount ELSE 0
         END AS attributed_fraud_loss
     FROM fact_transactions f
-    JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
-    JOIN fee_model m            ON m.transaction_type_key = f.transaction_type_key
+    JOIN fee_model m                 ON m.transaction_type_key = f.transaction_type_key
+    LEFT JOIN mv_duplicate_cashout_legs dup
+                                     ON dup.transaction_key = f.transaction_key
+),
+aggregated AS (
+    -- 30 rows out of 6.36M, via a hash aggregate on two integer keys.
+    SELECT
+        transaction_type_key,
+        band_id,
+        COUNT(*)                      AS txn_count,
+        SUM(amount)                   AS total_value,
+        SUM(fee)                      AS fee_revenue,
+        SUM(cost_per_txn)             AS processing_cost,
+        SUM(attributed_fraud_loss)    AS fraud_loss
+    FROM banded
+    GROUP BY transaction_type_key, band_id
+),
+band_labels AS (
+    SELECT * FROM (VALUES
+        (1::SMALLINT, '1. under 10K'),
+        (2::SMALLINT, '2. 10K - 100K'),
+        (3::SMALLINT, '3. 100K - 500K'),
+        (4::SMALLINT, '4. 500K - 1M'),
+        (5::SMALLINT, '5. 1M - 10M'),
+        (6::SMALLINT, '6. over 10M')
+    ) AS v(band_id, amount_band)
 )
 SELECT
-    type_name,
-    amount_band,
-    COUNT(*)                                        AS txn_count,
-    ROUND(SUM(amount) / 1e6, 2)                     AS total_value_millions,
-    ROUND(SUM(fee) / 1e6, 2)                        AS fee_revenue_millions,
-    ROUND(SUM(cost_per_txn) / 1e6, 2)               AS processing_cost_millions,
-    ROUND(SUM(attributed_fraud_loss) / 1e6, 2)      AS fraud_loss_millions,
-    ROUND((SUM(fee) - SUM(cost_per_txn) - SUM(attributed_fraud_loss)) / 1e6, 2)
-                                                    AS net_profit_millions,
-    ROUND(100.0 * SUM(fee) / NULLIF(SUM(amount), 0), 4) AS effective_take_rate_pct,
-    (SUM(fee) - SUM(cost_per_txn) - SUM(attributed_fraud_loss)) < 0 AS is_loss_making
-FROM banded
-GROUP BY type_name, amount_band
-ORDER BY type_name, amount_band;
+    t.type_name,
+    bl.amount_band,
+    a.txn_count,
+    ROUND(a.total_value / 1e6, 2)                    AS total_value_millions,
+    ROUND(a.fee_revenue / 1e6, 2)                    AS fee_revenue_millions,
+    ROUND(a.processing_cost / 1e6, 2)                AS processing_cost_millions,
+    ROUND(a.fraud_loss / 1e6, 2)                     AS fraud_loss_millions,
+    ROUND((a.fee_revenue - a.processing_cost - a.fraud_loss) / 1e6, 2)
+                                                     AS net_profit_millions,
+    ROUND(100.0 * a.fee_revenue / NULLIF(a.total_value, 0), 4) AS effective_take_rate_pct,
+    (a.fee_revenue - a.processing_cost - a.fraud_loss) < 0     AS is_loss_making
+FROM aggregated a
+JOIN dim_transaction_type t ON t.transaction_type_key = a.transaction_type_key
+JOIN band_labels bl         ON bl.band_id = a.band_id
+ORDER BY t.type_name, bl.amount_band;
 
 
 -- =============================================================================
@@ -174,39 +202,24 @@ ORDER BY type_name, amount_band;
 -- Feeds a combo chart: revenue bars with a net-profit line.
 -- =============================================================================
 CREATE OR REPLACE VIEW vw_profitability_daily AS
-WITH fraudulent_transfers AS (
-    SELECT f.amount, f.oldbalance_org
-    FROM fact_transactions f
-    JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
-    WHERE f.is_fraud AND t.type_name = 'TRANSFER'
-),
-duplicate_cashout_keys AS (
-    SELECT f.transaction_key
-    FROM fact_transactions f
-    JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
-    WHERE f.is_fraud
-      AND t.type_name = 'CASH_OUT'
-      AND EXISTS (
-          SELECT 1 FROM fraudulent_transfers ft
-          WHERE ft.amount = f.amount AND ft.oldbalance_org = f.oldbalance_org
-      )
-),
-daily AS (
+WITH daily AS (
     SELECT
         d.day_number,
         COUNT(*)                                                             AS txn_count,
         SUM(fn_transaction_fee(f.amount, m.fee_rate, m.fee_min, m.fee_max))  AS fee_revenue,
         SUM(m.cost_per_txn)                                                  AS processing_cost,
+        -- Excludes the duplicate CASH_OUT leg (see mv_duplicate_cashout_legs).
+        -- LEFT JOIN anti-join rather than a correlated NOT EXISTS: see the note
+        -- in vw_profitability_by_type_and_band.
         SUM(CASE
-                WHEN f.is_fraud
-                 AND f.transaction_key NOT IN (SELECT transaction_key FROM duplicate_cashout_keys)
+                WHEN f.is_fraud AND dup.transaction_key IS NULL
                 THEN f.amount ELSE 0
             END)                                                             AS fraud_loss,
         COUNT(DISTINCT d.date_key)                                           AS hours_observed
     FROM fact_transactions f
     JOIN dim_date d             ON d.date_key = f.date_key
-    JOIN dim_transaction_type t ON t.transaction_type_key = f.transaction_type_key
     JOIN fee_model m            ON m.transaction_type_key = f.transaction_type_key
+    LEFT JOIN mv_duplicate_cashout_legs dup ON dup.transaction_key = f.transaction_key
     GROUP BY d.day_number
 )
 SELECT
