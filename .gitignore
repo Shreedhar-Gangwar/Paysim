@@ -1,0 +1,15 @@
+# Raw data — too large for git; obtain from Kaggle (see README)
+data/raw/
+
+# Local environment / credentials — never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
